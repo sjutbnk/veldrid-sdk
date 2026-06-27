@@ -1,0 +1,18 @@
+root = true
+
+[*.cs]
+indent_style             = space
+indent_size              = 4
+end_of_line              = lf
+charset                  = utf-8
+trim_trailing_whitespace = true
+insert_final_newline     = true
+
+# Современный C# — file-scoped namespaces
+csharp_style_namespace_declarations                 = file_scoped:error
+# Nullable reference types
+dotnet_diagnostic.CS8600.severity                   = error
+dotnet_diagnostic.CS8603.severity                   = error
+# Var / implicit types
+csharp_style_var_for_built_in_types                 = false:suggestion
+csharp_style_var_when_type_is_apparent              = true:suggestion

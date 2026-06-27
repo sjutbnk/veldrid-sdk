@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>AntigravityEngine.Sandbox</RootNamespace>
+    <AssemblyName>Sandbox</AssemblyName>
+    <!-- Sandbox видит ТОЛЬКО Engine.Core — принцип тонкого RHI -->
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Только Engine.Core согласно архитектурному требованию -->
+    <ProjectReference Include="..\..\src\Engine.Core\Engine.Core.csproj" />
+    <!--
+      Platform.SDL и Renderer.Veldrid подключаются через DI / фабрику в рантайме.
+      Чтобы их сборки попали в выходной каталог, добавляем PrivateAssets=none
+      и ExcludeAssets=compile — бинарники копируются, но namespace недоступен на этапе компиляции.
+    -->
+    <ProjectReference Include="..\..\src\Platform.SDL\Platform.SDL.csproj">
+      <ExcludeAssets>compile</ExcludeAssets>
+      <PrivateAssets>none</PrivateAssets>
+    </ProjectReference>
+    <ProjectReference Include="..\..\src\Renderer.Veldrid\Renderer.Veldrid.csproj">
+      <ExcludeAssets>compile</ExcludeAssets>
+      <PrivateAssets>none</PrivateAssets>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>
