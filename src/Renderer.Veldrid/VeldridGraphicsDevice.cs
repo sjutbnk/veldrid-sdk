@@ -14,23 +14,51 @@ namespace AntigravityEngine.Renderer.Veldrid;
 /// <summary>
 /// Concrete implementation of <see cref="IGraphicsDevice"/> built on top of Veldrid.
 /// Prefers Vulkan; falls back to OpenGL on failure.
-/// Owns the swapchain, command list, and the global MVP UBO.
+///
+/// Owns three resource layouts and their associated GPU buffers/sampler:
+/// <list type="bullet">
+///   <item>set=0  SceneGlobals  (ViewProj + lighting params)</item>
+///   <item>set=1  ModelBlock    (per-object Model matrix)</item>
+///   <item>set=2  Texture2D + linear Sampler</item>
+/// </list>
 /// </summary>
 public sealed class VeldridGraphicsDevice : IGraphicsDevice
 {
-    private readonly GraphicsDevice  _gd;
-    private readonly CommandList     _commandList;
+    private readonly GraphicsDevice _gd;
+    private readonly CommandList    _commandList;
 
-    // ── MVP Uniform Buffer Object ─────────────────────────────────────────────
-    private readonly DeviceBuffer   _mvpBuffer;
-    private readonly ResourceLayout _mvpLayout;
-    private readonly ResourceSet    _mvpResourceSet;
+    // ── Scene globals (set=0) ─────────────────────────────────────────────────
+    // Layout:  [ViewProjection: 64B][LightDirection: 16B][LightColor: 16B][AmbientColor: 16B]
+    //           = 112 bytes total, std140-compatible.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SceneGlobalsGpu   // 112 bytes
+    {
+        public Matrix4x4 ViewProjection;  // 64 bytes
+        public Vector4   LightDirection;  // 16 bytes (xyz = dir, w = 0)
+        public Vector4   LightColor;      // 16 bytes
+        public Vector4   AmbientColor;    // 16 bytes
+    }
+
+    private readonly ResourceLayout _sceneLayout;
+    private readonly DeviceBuffer   _sceneBuffer;
+    private readonly ResourceSet    _sceneResourceSet;
+
+    // ── Model matrix (set=1) ──────────────────────────────────────────────────
+    private readonly ResourceLayout _modelLayout;
+    private readonly DeviceBuffer   _modelBuffer;       // 64 bytes (mat4)
+    private readonly ResourceSet    _modelResourceSet;
+
+    // ── Texture + Sampler (set=2) ─────────────────────────────────────────────
+    private readonly ResourceLayout _textureLayout;
+    private readonly Sampler        _linearSampler;
 
     private VeldridRenderContext? _activeContext;
-    private bool _disposed;
+    private bool                  _disposed;
 
     /// <inheritdoc/>
     public string BackendName { get; }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     public VeldridGraphicsDevice(IWindow window)
     {
@@ -39,15 +67,15 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
                 $"VeldridGraphicsDevice requires {nameof(SdlWindow)}, got {window.GetType().Name}.",
                 nameof(window));
 
-        // Must be done BEFORE any Veldrid/Vulkan code is touched.
+        // Must be called before any Veldrid or Vulkan type is touched.
         RegisterNativeLibraryResolver();
 
         var options = new GraphicsDeviceOptions(
-            debug:                          false,
-            swapchainDepthFormat:           PixelFormat.D24_UNorm_S8_UInt,
-            syncToVerticalBlank:            true,
-            resourceBindingModel:           ResourceBindingModel.Improved,
-            preferDepthRangeZeroToOne:      true,
+            debug:                             false,
+            swapchainDepthFormat:              PixelFormat.D24_UNorm_S8_UInt,
+            syncToVerticalBlank:               true,   // VSync on
+            resourceBindingModel:              ResourceBindingModel.Improved,
+            preferDepthRangeZeroToOne:         true,
             preferStandardClipSpaceYDirection: true);
 
         _gd = TryCreateVulkan(sdlWindow.NativeWindow, options)
@@ -56,23 +84,64 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
         BackendName = _gd.BackendType.ToString();
         EngineLogger.Info($"GPU backend: {BackendName} | Device: {_gd.DeviceName}");
 
-        // ── MVP UBO ───────────────────────────────────────────────────────────
-        _mvpLayout = _gd.ResourceFactory.CreateResourceLayout(
-            new ResourceLayoutDescription(
-                new ResourceLayoutElementDescription(
-                    "MvpBlock", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+        var factory = _gd.ResourceFactory;
 
-        _mvpBuffer = _gd.ResourceFactory.CreateBuffer(
+        // ── set=0  SceneGlobals ───────────────────────────────────────────────
+        _sceneLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
+            new ResourceLayoutElementDescription(
+                "SceneGlobals", ResourceKind.UniformBuffer,
+                ShaderStages.Vertex | ShaderStages.Fragment)));
+
+        _sceneBuffer = factory.CreateBuffer(
+            new BufferDescription(112u, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
+
+        _sceneResourceSet = factory.CreateResourceSet(
+            new ResourceSetDescription(_sceneLayout, _sceneBuffer));
+
+        // Initialise buffer with identity VP so the first frame is safe.
+        _gd.UpdateBuffer(_sceneBuffer, 0u, new SceneGlobalsGpu
+        {
+            ViewProjection = Matrix4x4.Identity,
+            LightDirection = Vector4.UnitZ,
+            LightColor     = Vector4.One,
+            AmbientColor   = new Vector4(0.15f, 0.15f, 0.15f, 1f),
+        });
+
+        // ── set=1  ModelBlock ─────────────────────────────────────────────────
+        _modelLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
+            new ResourceLayoutElementDescription(
+                "ModelBlock", ResourceKind.UniformBuffer, ShaderStages.Vertex)));
+
+        _modelBuffer = factory.CreateBuffer(
             new BufferDescription(64u, BufferUsage.UniformBuffer | BufferUsage.Dynamic));
 
-        _mvpResourceSet = _gd.ResourceFactory.CreateResourceSet(
-            new ResourceSetDescription(_mvpLayout, _mvpBuffer));
+        _modelResourceSet = factory.CreateResourceSet(
+            new ResourceSetDescription(_modelLayout, _modelBuffer));
 
-        // Upload identity matrix as default so the buffer is never uninitialised
-        _gd.UpdateBuffer(_mvpBuffer, 0u, Matrix4x4.Identity);
+        _gd.UpdateBuffer(_modelBuffer, 0u, Matrix4x4.Identity);
 
-        _commandList = _gd.ResourceFactory.CreateCommandList();
-        EngineLogger.Info("MVP UBO and CommandList initialised.");
+        // ── set=2  Texture + Sampler layout ──────────────────────────────────
+        _textureLayout = factory.CreateResourceLayout(new ResourceLayoutDescription(
+            new ResourceLayoutElementDescription(
+                "Tex",  ResourceKind.TextureReadOnly, ShaderStages.Fragment),
+            new ResourceLayoutElementDescription(
+                "Samp", ResourceKind.Sampler,         ShaderStages.Fragment)));
+
+        _linearSampler = factory.CreateSampler(new SamplerDescription(
+            addressModeU:      SamplerAddressMode.Wrap,
+            addressModeV:      SamplerAddressMode.Wrap,
+            addressModeW:      SamplerAddressMode.Wrap,
+            filter:            SamplerFilter.MinLinear_MagLinear_MipLinear,
+            comparisonKind:    null,
+            maximumAnisotropy: 0,
+            minimumLod:        0u,
+            maximumLod:        uint.MaxValue,
+            lodBias:           0,
+            borderColor:       SamplerBorderColor.TransparentBlack));
+
+        // ── Command list ──────────────────────────────────────────────────────
+        _commandList = factory.CreateCommandList();
+        EngineLogger.Info("SceneGlobals, ModelBlock, Texture layouts and CommandList initialised.");
     }
 
     // ── IGraphicsDevice ───────────────────────────────────────────────────────
@@ -82,7 +151,12 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _activeContext = new VeldridRenderContext(
-            _commandList, _gd.SwapchainFramebuffer, _mvpResourceSet);
+            _commandList,
+            _gd.SwapchainFramebuffer,
+            _gd,
+            _modelBuffer,
+            _sceneResourceSet,
+            _modelResourceSet);
         return _activeContext;
     }
 
@@ -114,23 +188,42 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
             _gd.ResourceFactory,
             _gd.SwapchainFramebuffer.OutputDescription,
             description,
-            _mvpLayout);
+            _sceneLayout,
+            _modelLayout,
+            _textureLayout);
     }
 
     /// <inheritdoc/>
-    public void SetMvp(Matrix4x4 mvp)
+    public ITexture2D CreateTexture2D(uint width, uint height, byte[] rgbaPixelData)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(rgbaPixelData);
+        if (rgbaPixelData.Length != (int)(width * height * 4))
+            throw new ArgumentException(
+                $"Expected {width * height * 4} bytes, got {rgbaPixelData.Length}.");
+
+        return new VeldridTexture2D(_gd, _textureLayout, _linearSampler, width, height, rgbaPixelData);
+    }
+
+    /// <inheritdoc/>
+    public void SetSceneGlobals(
+        Matrix4x4 viewProjection,
+        Vector3   lightDirection,
+        Vector4   lightColor,
+        Vector4   ambientColor)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // KEY INSIGHT: System.Numerics.Matrix4x4 is row-major in memory.
-        // When GLSL reads it as column-major mat4, the computation:
-        //     GLSL:  Mvp * vec4(pos, 1)
-        // is mathematically equivalent to:
-        //     C#:    Vector4.Transform(pos, mvp)   (i.e., v * M)
-        //
-        // which is exactly what we want — Model*View*Proj applied to the vertex.
-        // DO NOT transpose: transposing would flip the meaning and break the transform.
-        _gd.UpdateBuffer(_mvpBuffer, 0u, mvp);
+        // C# Matrix4x4 is row-major. GLSL mat4 is column-major.
+        // When Veldrid uploads bytes directly, GLSL(M*v) == C#(v*M).
+        // Do NOT transpose — the convention works correctly as-is.
+        _gd.UpdateBuffer(_sceneBuffer, 0u, new SceneGlobalsGpu
+        {
+            ViewProjection = viewProjection,
+            LightDirection = new Vector4(lightDirection, 0f),
+            LightColor     = lightColor,
+            AmbientColor   = ambientColor,
+        });
     }
 
     /// <inheritdoc/>
@@ -139,16 +232,22 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
         if (_disposed) return;
         _disposed = true;
 
-        _mvpResourceSet.Dispose();
-        _mvpBuffer.Dispose();
-        _mvpLayout.Dispose();
+        // Dispose in reverse creation order
         _commandList.Dispose();
+        _linearSampler.Dispose();
+        _textureLayout.Dispose();
+        _modelResourceSet.Dispose();
+        _modelBuffer.Dispose();
+        _modelLayout.Dispose();
+        _sceneResourceSet.Dispose();
+        _sceneBuffer.Dispose();
+        _sceneLayout.Dispose();
         _gd.Dispose();
 
         EngineLogger.Info("VeldridGraphicsDevice disposed.");
     }
 
-    // ── Backend creation helpers ──────────────────────────────────────────────
+    // ── Backend creation ──────────────────────────────────────────────────────
 
     private static GraphicsDevice? TryCreateVulkan(
         global::Veldrid.Sdl2.Sdl2Window nativeWindow,
@@ -191,13 +290,12 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
     private static readonly object _resolverLock = new();
 
     /// <summary>
-    /// Registers a custom P/Invoke resolver on EVERY assembly in the AppDomain,
-    /// and hooks future assembly loads.  This intercepts:
+    /// Registers a P/Invoke resolver on every current and future assembly so that:
     /// <list type="bullet">
-    ///   <item><c>libdl</c> → <c>libdl.so.2</c> (Vulkan C# bindings need dlerror/dlopen)</item>
-    ///   <item><c>vulkan</c> → <c>libvulkan.so.1</c> (actual Vulkan loader)</item>
+    ///   <item><c>"libdl"</c>   → <c>libdl.so.2</c> / <c>libc.so.6</c> (needed by vk.NET's Libdl)</item>
+    ///   <item><c>"vulkan"</c>  → <c>libvulkan.so.1</c> (Arch/CachyOS Vulkan loader name)</item>
     /// </list>
-    /// Must be called before any Veldrid/Vulkan type is first accessed.
+    /// Must run before any Veldrid or Vulkan code accesses native libraries.
     /// </summary>
     private static void RegisterNativeLibraryResolver()
     {
@@ -211,27 +309,24 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
 
         DllImportResolver resolver = LinuxNativeResolver;
 
-        // Register on all currently loaded assemblies
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            TryRegisterResolver(asm, resolver);
+            TrySetResolver(asm, resolver);
 
-        // Register on all future assemblies (e.g. "vk" / "Vulkan" that load lazily)
         AppDomain.CurrentDomain.AssemblyLoad += (_, args) =>
-            TryRegisterResolver(args.LoadedAssembly, resolver);
+            TrySetResolver(args.LoadedAssembly, resolver);
     }
 
-    private static void TryRegisterResolver(Assembly asm, DllImportResolver resolver)
+    private static void TrySetResolver(Assembly asm, DllImportResolver resolver)
     {
         try { NativeLibrary.SetDllImportResolver(asm, resolver); }
-        catch { /* Some assemblies don't support custom resolvers; ignore silently. */ }
+        catch { /* Some assemblies don't support custom resolvers — ignore. */ }
     }
 
     private static IntPtr LinuxNativeResolver(
         string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
-        // ── libdl: needed by the Vulkan C# binding (vk.NET) to call dlopen/dlerror
-        // On modern glibc (Arch/CachyOS) these symbols live in libc.so.6.
-        // There is usually also a libdl.so.2 compat stub.
+        // libdl: required by vk.NET (Vulkan.Libdl) for dlopen/dlerror.
+        // On modern glibc (Arch/CachyOS) the symbols live in libc.so.6.
         if (libraryName is "libdl" or "dl" or "libdl.so")
         {
             if (NativeLibrary.TryLoad("libdl.so.2", assembly, searchPath, out var h)) return h;
@@ -239,13 +334,13 @@ public sealed class VeldridGraphicsDevice : IGraphicsDevice
             if (NativeLibrary.TryLoad("libc",        assembly, searchPath, out h))    return h;
         }
 
-        // ── Vulkan loader: Arch/CachyOS installs libvulkan.so.1 (not libvulkan.so)
+        // Vulkan loader: Arch/CachyOS installs libvulkan.so.1, not libvulkan.so.
         if (libraryName is "vulkan" or "libvulkan" or "libvulkan.so")
         {
             if (NativeLibrary.TryLoad("libvulkan.so.1", assembly, searchPath, out var h)) return h;
             if (NativeLibrary.TryLoad("libvulkan.so",   assembly, searchPath, out h))    return h;
         }
 
-        return IntPtr.Zero; // fall back to default resolution
+        return IntPtr.Zero;
     }
 }

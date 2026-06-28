@@ -7,8 +7,13 @@ namespace AntigravityEngine.Renderer.Veldrid;
 
 /// <summary>
 /// Concrete implementation of <see cref="IPipeline"/>.
-/// Compiles GLSL → SPIR-V → backend shaders, then assembles a Veldrid GraphicsPipeline.
-/// Requires a <see cref="ResourceLayout"/> for the MVP UBO (set=0, binding=0).
+/// Compiles GLSL → SPIR-V → backend shaders and creates a GraphicsPipeline
+/// with three resource layouts:
+/// <list type="bullet">
+///   <item>set=0  SceneGlobals UBO  (ViewProjection + lighting)</item>
+///   <item>set=1  ModelBlock UBO    (per-object Model matrix)</item>
+///   <item>set=2  Texture + Sampler (per-material albedo)</item>
+/// </list>
 /// </summary>
 internal sealed class VeldridPipeline : IPipeline
 {
@@ -20,7 +25,9 @@ internal sealed class VeldridPipeline : IPipeline
         ResourceFactory   factory,
         OutputDescription outputDescription,
         PipelineDescription desc,
-        ResourceLayout    mvpLayout)
+        ResourceLayout    sceneLayout,
+        ResourceLayout    modelLayout,
+        ResourceLayout    textureLayout)
     {
         // ── 1. GLSL → SPIR-V ──────────────────────────────────────────────────
         var vertSpirv = SpirvCompilation.CompileGlslToSpirv(
@@ -33,26 +40,36 @@ internal sealed class VeldridPipeline : IPipeline
 
         // ── 2. SPIR-V → backend shaders ──────────────────────────────────────
         var shaders = factory.CreateFromSpirv(
-            new ShaderDescription(ShaderStages.Vertex,   vertSpirv.SpirvBytes,   "main"),
-            new ShaderDescription(ShaderStages.Fragment, fragSpirv.SpirvBytes,   "main"));
+            new ShaderDescription(ShaderStages.Vertex,   vertSpirv.SpirvBytes, "main"),
+            new ShaderDescription(ShaderStages.Fragment, fragSpirv.SpirvBytes, "main"));
 
-        // ── 3. Vertex layout: GpuVertex = Position (Float3, 12B) + Color (Float4, 16B)
-        // TextureCoordinate semantics work for both OpenGL and Vulkan backends
-        // — they map to attribute locations 0 and 1 respectively.
+        // ── 3. Vertex layout: Position (Float3) | Normal (Float3) | TexCoord (Float2)
+        //       = 32 bytes per vertex, matching VeldridMesh.GpuVertex.
         var vertexLayout = new VertexLayoutDescription(
             new VertexElementDescription("Position", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
-            new VertexElementDescription("Color",    VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float4));
+            new VertexElementDescription("Normal",   VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float3),
+            new VertexElementDescription("TexCoord", VertexElementSemantic.TextureCoordinate, VertexElementFormat.Float2));
 
         // ── 4. Assemble pipeline ──────────────────────────────────────────────
-        // CullNone: eliminates winding-order ambiguity (depth test handles occlusion).
-        // DepthOnlyLessEqual: standard depth test, clear to 1.0 → fragments at z<1 pass.
+        // Fallback: If OutputDescription lacks a depth attachment, ensure we configure one,
+        // otherwise the pipeline completely disables depth testing!
+        if (!outputDescription.DepthAttachment.HasValue)
+        {
+            outputDescription.DepthAttachment = new OutputAttachmentDescription(PixelFormat.D24_UNorm_S8_UInt);
+        }
+
         var pipelineDesc = new GraphicsPipelineDescription(
             blendState:                  BlendStateDescription.SingleOverrideBlend,
             depthStencilStateDescription: DepthStencilStateDescription.DepthOnlyLessEqual,
-            rasterizerState:             RasterizerStateDescription.CullNone,
+            rasterizerState:             new RasterizerStateDescription(
+                cullMode: FaceCullMode.Back,
+                fillMode: PolygonFillMode.Solid,
+                frontFace: FrontFace.CounterClockwise,
+                depthClipEnabled: true,
+                scissorTestEnabled: false),
             primitiveTopology:           PrimitiveTopology.TriangleList,
             shaderSet:                   new ShaderSetDescription(new[] { vertexLayout }, shaders),
-            resourceLayouts:             new[] { mvpLayout },
+            resourceLayouts:             new[] { sceneLayout, modelLayout, textureLayout },
             outputs:                     outputDescription);
 
         NativePipeline = factory.CreateGraphicsPipeline(ref pipelineDesc);

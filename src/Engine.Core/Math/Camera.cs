@@ -51,13 +51,8 @@ public sealed class Camera
 
     /// <summary>
     /// Returns a Perspective Projection matrix.
-    /// <para>
-    /// <see cref="Matrix4x4.CreatePerspectiveFieldOfView"/> already produces a
-    /// D3D-style matrix with clip-space Z mapped to [0, 1] — matching Veldrid's
-    /// <c>preferDepthRangeZeroToOne = true</c>.  No additional remapping needed.
-    /// </para>
     /// </summary>
     public Matrix4x4 GetProjectionMatrix(float aspectRatio)
         => Matrix4x4.CreatePerspectiveFieldOfView(
-            FovDegrees * DegToRad, aspectRatio, NearPlane, FarPlane);
+            FovDegrees * (MathF.PI / 180f), aspectRatio, NearPlane, FarPlane);
 }

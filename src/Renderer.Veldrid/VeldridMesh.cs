@@ -1,6 +1,5 @@
 // src/Renderer.Veldrid/VeldridMesh.cs
 using AntigravityEngine.Core.Graphics;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Veldrid;
 
@@ -8,9 +7,8 @@ namespace AntigravityEngine.Renderer.Veldrid;
 
 /// <summary>
 /// Concrete implementation of <see cref="IMesh"/>.
-/// Holds vertex buffer and index buffer on the GPU and manages their lifetime.
-/// Vertices are stored as interleaved Position (Float3) + Color (Float4) = 28 bytes.
-/// Indices are UInt32.
+/// Interleaves <see cref="MeshData"/> into a tightly packed
+/// VertexPositionNormalTexture GPU vertex buffer and a UInt32 index buffer.
 /// </summary>
 internal sealed class VeldridMesh : IMesh
 {
@@ -22,24 +20,28 @@ internal sealed class VeldridMesh : IMesh
     internal DeviceBuffer VertexBuffer { get; }
     internal DeviceBuffer IndexBuffer  { get; }
 
+    // Internal GPU vertex that exactly mirrors VertexPositionNormalTexture (32 bytes).
     [StructLayout(LayoutKind.Sequential)]
     private struct GpuVertex
     {
-        public Vector3 Position;
-        public Vector4 Color;
-    }
+        public System.Numerics.Vector3 Position;   // offset  0, 12 bytes
+        public System.Numerics.Vector3 Normal;     // offset 12, 12 bytes
+        public System.Numerics.Vector2 TexCoord;   // offset 24,  8 bytes
+    }                                               // total: 32 bytes
 
-    /// <summary>
-    /// Creates and immediately fills GPU buffers from <see cref="MeshData"/>.
-    /// </summary>
     public VeldridMesh(GraphicsDevice gd, MeshData data)
     {
         IndexCount = (uint)data.Indices.Length;
 
-        // Build interleaved vertex array
+        // Interleave into GPU vertex array
         var verts = new GpuVertex[data.Positions.Length];
         for (int i = 0; i < verts.Length; i++)
-            verts[i] = new GpuVertex { Position = data.Positions[i], Color = data.Colors[i] };
+            verts[i] = new GpuVertex
+            {
+                Position = data.Positions[i],
+                Normal   = data.Normals[i],
+                TexCoord = data.TexCoords[i],
+            };
 
         uint vbSize = (uint)(verts.Length * Marshal.SizeOf<GpuVertex>());
         VertexBuffer = gd.ResourceFactory.CreateBuffer(
