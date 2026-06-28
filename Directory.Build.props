@@ -1,0 +1,7 @@
+<Project>
+  <!-- Silence the known Newtonsoft.Json 9.0.1 vulnerability warning (NU1903).
+       Veldrid.Sdl2 transitively depends on it; we override to the safe version. -->
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>

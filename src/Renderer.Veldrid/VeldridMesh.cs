@@ -1,13 +1,16 @@
 // src/Renderer.Veldrid/VeldridMesh.cs
 using AntigravityEngine.Core.Graphics;
-using System.Runtime.CompilerServices;
+using System.Numerics;
+using System.Runtime.InteropServices;
 using Veldrid;
 
 namespace AntigravityEngine.Renderer.Veldrid;
 
 /// <summary>
-/// Конкретная реализация <see cref="IMesh"/>.
-/// Хранит vertex buffer и index buffer на GPU, управляет их жизненным циклом.
+/// Concrete implementation of <see cref="IMesh"/>.
+/// Holds vertex buffer and index buffer on the GPU and manages their lifetime.
+/// Vertices are stored as interleaved Position (Float3) + Color (Float4) = 28 bytes.
+/// Indices are UInt32.
 /// </summary>
 internal sealed class VeldridMesh : IMesh
 {
@@ -19,24 +22,34 @@ internal sealed class VeldridMesh : IMesh
     internal DeviceBuffer VertexBuffer { get; }
     internal DeviceBuffer IndexBuffer  { get; }
 
-    /// <summary>
-    /// Создаёт и немедленно заполняет GPU-буферы переданными данными.
-    /// </summary>
-    public VeldridMesh(GraphicsDevice gd, Vertex[] vertices, ushort[] indices)
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GpuVertex
     {
-        IndexCount = (uint)indices.Length;
+        public Vector3 Position;
+        public Vector4 Color;
+    }
 
-        // Vertex buffer
-        var vertexBufferSize = (uint)(vertices.Length * Unsafe.SizeOf<Vertex>());
+    /// <summary>
+    /// Creates and immediately fills GPU buffers from <see cref="MeshData"/>.
+    /// </summary>
+    public VeldridMesh(GraphicsDevice gd, MeshData data)
+    {
+        IndexCount = (uint)data.Indices.Length;
+
+        // Build interleaved vertex array
+        var verts = new GpuVertex[data.Positions.Length];
+        for (int i = 0; i < verts.Length; i++)
+            verts[i] = new GpuVertex { Position = data.Positions[i], Color = data.Colors[i] };
+
+        uint vbSize = (uint)(verts.Length * Marshal.SizeOf<GpuVertex>());
         VertexBuffer = gd.ResourceFactory.CreateBuffer(
-            new BufferDescription(vertexBufferSize, BufferUsage.VertexBuffer));
-        gd.UpdateBuffer(VertexBuffer, bufferOffsetInBytes: 0, source: vertices);
+            new BufferDescription(vbSize, BufferUsage.VertexBuffer));
+        gd.UpdateBuffer(VertexBuffer, 0u, verts);
 
-        // Index buffer
-        var indexBufferSize = (uint)(indices.Length * sizeof(ushort));
+        uint ibSize = (uint)(data.Indices.Length * sizeof(uint));
         IndexBuffer = gd.ResourceFactory.CreateBuffer(
-            new BufferDescription(indexBufferSize, BufferUsage.IndexBuffer));
-        gd.UpdateBuffer(IndexBuffer, bufferOffsetInBytes: 0, source: indices);
+            new BufferDescription(ibSize, BufferUsage.IndexBuffer));
+        gd.UpdateBuffer(IndexBuffer, 0u, data.Indices);
     }
 
     /// <inheritdoc/>
